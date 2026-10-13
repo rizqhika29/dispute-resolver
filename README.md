@@ -4,8 +4,8 @@ Decentralized Dispute Resolution powered by AI consensus.
 
 ## Deployed Contract
 
-- **Address:** `0x9Bffb49ACF7727a14d247F220dab9251aDf7D3cA`
-- **Explorer:** https://explorer-studio.genlayer.com/address/0x9Bffb49ACF7727a14d247F220dab9251aDf7D3cA
+- **Address:** `0xF4EAB30F27AF94478dFD8B0e728543b1C0b59785`
+- **Explorer:** https://explorer-studio.genlayer.com/address/0xF4EAB30F27AF94478dFD8B0e728543b1C0b59785
 
 ## Overview
 
@@ -20,8 +20,11 @@ window closes.
 
 ```
 evidence  ->  verdict  ->  appealed  ->  verdict  ->  closed
-   |            |                          |
-   +-- cancel   +-- execute (window over)  +-- re-resolve after bond
+   |            |            |             |
+   +-- cancel   +-- execute  +-- timeout   +-- execute
+                  (window)     (enforces      (window)
+                                last verdict)
+   +-- timeout (no verdict -> escrow split 50/50)
 ```
 
 1. **create_dispute** - Creator locks escrow and names a counterparty
@@ -30,6 +33,28 @@ evidence  ->  verdict  ->  appealed  ->  verdict  ->  closed
 4. **resolve_dispute** - AI consensus records a binding verdict
 5. **appeal_verdict** - Either party may appeal with a 5% bond (max 3)
 6. **execute_verdict** - After the appeal window, escrow is released
+7. **timeout_settle** - Anyone can settle stuck escrow after a deadline
+
+## Timeout Settlement
+
+Escrow can never be stuck:
+
+- **No verdict before resolve deadline** - `timeout_settle` splits escrow
+  50/50 (the stall was through no fault of either party)
+- **Appeal posted but re-resolution times out** - `timeout_settle`
+  enforces the last recorded verdict and settles funds by it
+
+## Per-Bond Accounting
+
+Every appeal bond is stored as its own `BondRecord` with its own
+appellant, amount, and round number. At settlement, each bond is:
+
+- Refunded to its appellant if the final verdict favors them (or is a
+  draw)
+- Paid to the opposing party if the final verdict favors the other side
+
+Multiple appeals can never redirect an earlier party's bond based on the
+last appellant alone.
 
 ## Design Principles
 
@@ -45,6 +70,14 @@ evidence  ->  verdict  ->  appealed  ->  verdict  ->  closed
 4. **Deferred atomic payout.** `resolve_dispute` only records the verdict.
    `execute_verdict` releases escrow in one transaction after the appeal
    window expires, guarded by `payout_executed` so it can never run twice.
+5. **Per-bond settlement.** Every appeal bond is stored as its own record
+   with its own appellant. At settlement each bond is refunded to its
+   appellant if the final verdict favors them (or is a draw), otherwise
+   paid to the opposing party. Multiple appeals can never redirect an
+   earlier party's bond based on the last appellant alone.
+6. **Timeout safety.** `timeout_settle` is callable by anyone: splits
+   escrow 50/50 if no verdict was recorded before the resolve deadline,
+   or enforces the last recorded verdict if re-resolution timed out.
 
 ## Contract Methods
 
@@ -58,6 +91,7 @@ evidence  ->  verdict  ->  appealed  ->  verdict  ->  closed
 | `resolve_dispute(dispute_id)` | Run AI consensus to record verdict |
 | `appeal_verdict(dispute_id)` | Appeal with 5% bond (payable) |
 | `execute_verdict(dispute_id)` | Release escrow after appeal window |
+| `timeout_settle(dispute_id)` | Settle stuck escrow after deadline |
 | `cancel_dispute(dispute_id)` | Cancel during evidence, escrow refunded |
 
 ### View Methods
@@ -96,7 +130,8 @@ dispute-resolver/
 │   └── integration/
 │       ├── conftest.py           # RPC rate-limit throttle
 │       ├── test_final_deploy.py  # Deploy + test all methods
-│       └── test_appeal_flow.py   # Appeal lifecycle
+│       ├── test_appeal_flow.py   # Appeal lifecycle
+│       └── test_timeout.py       # Timeout settlement + per-bond
 ├── deployment.toml
 ├── gltest.config.yaml
 ├── requirements.txt
