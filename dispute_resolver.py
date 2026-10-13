@@ -7,30 +7,39 @@ Decentralized Dispute Resolution powered by AI consensus.
 
 Two parties lock escrow, submit their claims as text, and a committee of
 AI validators independently evaluates both submissions to reach a binding
-verdict. Funds are released only after the appeal window closes.
+verdict. Funds are released only after the appeal window closes, and any
+stuck escrow can be settled through the timeout path.
 
 Lifecycle
 ---------
 evidence -> verdict (resolved, appeal window open)
-        -> appealed (bond posted, re-resolution required)
+        -> appealed (bond posted, re-resolution window open; last verdict kept)
         -> verdict (re-resolved, new appeal window)
-        -> closed (execute_verdict: escrow + bonds settled)
+        -> closed (execute_verdict or timeout_settle: funds settled)
 evidence -> cancelled (creator cancels, escrow refunded)
 
-Design principles (addressing prior review feedback)
------------------------------------------------------
+Timeout paths (timeout_settle):
+- Evidence closed but no verdict within the resolve window: escrow is
+  split 50/50 -- resolution stalled through no fault of either party.
+- Appeal posted but re-resolution did not complete within the resolve
+  window: the last recorded verdict is enforced and funds settle by it.
+
+Design principles
+-----------------
 1. No external URLs. Evidence is plain text submitted by each party
-   directly in the transaction. There is nothing to fetch and nothing
-   to spoof -- the claim text is stored on-chain verbatim.
+   directly in the transaction, stored on-chain verbatim.
 2. Independent evaluation. Each validator reads both parties' claims
    from chain state and independently asks its own LLM to weigh them.
-   Validators never see each other's reasoning.
-3. Exact binding on the verdict. The validator must independently
-   derive the same winning party as the leader. No tolerance -- the
-   verdict directly controls who receives the escrow.
+3. Exact binding on the verdict. The validator must independently derive
+   the same winning party as the leader. No tolerance.
 4. Deferred atomic payout. resolve_dispute only records the verdict.
-   execute_verdict releases escrow in one transaction after the appeal
-   window expires, and can never run twice (payout_executed guard).
+   execute_verdict releases escrow after the appeal window expires, and
+   can never run twice (payout_executed guard).
+5. Per-bond settlement. Every appeal bond is stored as its own record
+   with its own appellant. At settlement each bond is refunded to its
+   appellant if the final verdict favors them (or is a draw), otherwise
+   paid to the opposing party. Multiple appeals can never redirect an
+   earlier party's bond based on the last appellant alone.
 """
 
 from genlayer import *
@@ -214,6 +223,22 @@ def _validator_fn(leaders_res, description, p_claim, d_claim, p_name, d_name) ->
 
 @allow_storage
 @dataclass
+class BondRecord:
+    """One appeal bond: which party posted it, how much, which round."""
+    appellant: Address
+    amount: u256
+    round: u256
+
+    def as_dict(self) -> dict:
+        return {
+            "appellant": str(self.appellant),
+            "amount": int(self.amount),
+            "round": int(self.round),
+        }
+
+
+@allow_storage
+@dataclass
 class Dispute:
     dispute_id: str
     creator: Address
@@ -233,9 +258,9 @@ class Dispute:
     verdict_reasoning: str
     resolved_at: u256
     winner: Address         # zero address until resolved
-    appeal_bond: u256
+    bonds: DynArray[BondRecord]   # one record per appeal, own appellant
+    appeal_bond_total: u256
     appeal_count: u256
-    appellant: Address      # last appeal poster, zero if none
     payout_executed: bool
 
     def as_dict(self) -> dict:
@@ -258,9 +283,9 @@ class Dispute:
             "verdict_reasoning": self.verdict_reasoning,
             "resolved_at": int(self.resolved_at),
             "winner": str(self.winner),
-            "appeal_bond": int(self.appeal_bond),
+            "bonds": [b.as_dict() for b in self.bonds],
+            "appeal_bond_total": int(self.appeal_bond_total),
             "appeal_count": int(self.appeal_count),
-            "appellant": str(self.appellant),
             "payout_executed": self.payout_executed,
         }
 
@@ -292,6 +317,58 @@ class DisputeResolver(gl.Contract):
         self.evidence_deadline_seconds = u256(int(evidence_deadline_seconds))
         self.resolve_deadline_seconds = u256(int(resolve_deadline_seconds))
         self.appeal_window_seconds = u256(int(appeal_window_seconds))
+
+    # -- Internal: settle escrow + per-bond funds ---------------------------
+
+    def _settle_funds(self, dispute: Dispute) -> None:
+        """Transfer escrow and every bond according to the recorded verdict.
+
+        Each bond is settled by its OWN appellant: refunded if the final
+        verdict favors that appellant (or is a draw), otherwise paid to
+        the opposing party. Earlier bonds are never redirected by a later
+        appellant's identity.
+        """
+        escrow = int(dispute.escrow_amount)
+        if escrow > 0:
+            if dispute.verdict == "draw":
+                half = escrow // 2
+                remainder = escrow - half * 2
+                _transfer(dispute.creator, half + remainder)
+                _transfer(dispute.counterparty, half)
+            else:
+                _transfer(dispute.winner, escrow)
+
+        for bond in dispute.bonds:
+            amt = int(bond.amount)
+            if amt <= 0:
+                continue
+            appellant = bond.appellant
+            appellant_won = (
+                dispute.verdict == "draw" or dispute.winner == appellant
+            )
+            if appellant_won:
+                _transfer(appellant, amt)
+            elif appellant == dispute.creator:
+                _transfer(dispute.counterparty, amt)
+            elif appellant == dispute.counterparty:
+                _transfer(dispute.creator, amt)
+            else:
+                # Defensive: unknown appellant (should not happen) -- refund
+                _transfer(appellant, amt)
+
+    def _close_dispute(self, dispute: Dispute) -> None:
+        """Mark dispute closed and decrement active counters."""
+        dispute.payout_executed = True
+        dispute.status = "closed"
+
+        c_key = str(dispute.creator)
+        c_active = int(self.disputes_by_creator.get(c_key, u256(0)))
+        if c_active > 0:
+            self.disputes_by_creator[c_key] = u256(c_active - 1)
+        cp_key = str(dispute.counterparty)
+        cp_active = int(self.disputes_by_counterparty.get(cp_key, u256(0)))
+        if cp_active > 0:
+            self.disputes_by_counterparty[cp_key] = u256(cp_active - 1)
 
     # -- Create dispute ----------------------------------------------------
 
@@ -340,9 +417,9 @@ class DisputeResolver(gl.Contract):
             verdict_reasoning="",
             resolved_at=u256(0),
             winner=_zero_address(),
-            appeal_bond=u256(0),
+            bonds=[],
+            appeal_bond_total=u256(0),
             appeal_count=u256(0),
-            appellant=_zero_address(),
             payout_executed=False,
         )
 
@@ -491,7 +568,12 @@ class DisputeResolver(gl.Contract):
 
     @gl.public.write.payable
     def appeal_verdict(self, dispute_id: str) -> None:
-        """Appeal a verdict by posting a bond. Triggers re-resolution."""
+        """Appeal a verdict by posting a bond. Triggers re-resolution.
+
+        The bond is recorded as its own BondRecord with this call's sender
+        as appellant. The last verdict is kept so that a re-resolution
+        timeout can still settle by it.
+        """
         dispute_id = str(dispute_id)
         dispute = self.disputes.get(dispute_id)
         if dispute is None:
@@ -521,14 +603,16 @@ class DisputeResolver(gl.Contract):
                 f"appeal bond must be at least {bond_required} wei"
             )
 
-        dispute.appeal_bond = u256(int(dispute.appeal_bond) + bond_sent)
-        dispute.appeal_count = dispute.appeal_count + u256(1)
-        dispute.appellant = sender
+        # Record this appeal's bond with its own appellant and round
+        new_count = dispute.appeal_count + u256(1)
+        dispute.bonds.append(
+            BondRecord(appellant=sender, amount=u256(bond_sent), round=new_count)
+        )
+        dispute.appeal_bond_total = u256(int(dispute.appeal_bond_total) + bond_sent)
+        dispute.appeal_count = new_count
         dispute.status = "appealed"
-        dispute.verdict = ""
-        dispute.verdict_reasoning = ""
-        dispute.verdict_confidence = u256(0)
-        dispute.winner = _zero_address()
+        # The last verdict is intentionally KEPT: if re-resolution times
+        # out, timeout_settle enforces it.
         dispute.resolve_deadline = u256(int(now) + int(self.resolve_deadline_seconds))
         self.disputes[dispute_id] = dispute
 
@@ -538,9 +622,8 @@ class DisputeResolver(gl.Contract):
     def execute_verdict(self, dispute_id: str) -> None:
         """Release escrow to the winner after the appeal window expires.
 
-        Settles the appeal bond: refunded to the appellant if the verdict
-        stood, or paid to the opposing party if the appeal flipped it.
-        Runs at most once (payout_executed guard).
+        Settles each appeal bond by its own appellant against the final
+        verdict. Runs at most once (payout_executed guard).
         """
         dispute_id = str(dispute_id)
         dispute = self.disputes.get(dispute_id)
@@ -555,49 +638,66 @@ class DisputeResolver(gl.Contract):
         if int(now) <= int(dispute.resolve_deadline):
             raise gl.vm.UserError("appeal window is still open")
 
-        dispute.payout_executed = True
-        dispute.status = "closed"
+        self._settle_funds(dispute)
+        self._close_dispute(dispute)
         self.disputes[dispute_id] = dispute
 
-        # -- Escrow settlement --
-        escrow = int(dispute.escrow_amount)
-        if escrow > 0:
-            if dispute.verdict == "draw":
-                half = escrow // 2
-                remainder = escrow - half * 2
-                _transfer(dispute.creator, half + remainder)
-                _transfer(dispute.counterparty, half)
-            else:
-                _transfer(dispute.winner, escrow)
+    # -- Timeout settlement -------------------------------------------------
 
-        # -- Appeal bond settlement --
-        bond = int(dispute.appeal_bond)
-        if bond > 0 and dispute.appellant != _zero_address():
-            appellant_lost = (
-                dispute.verdict != "draw"
-                and dispute.winner != dispute.appellant
+    @gl.public.write
+    def timeout_settle(self, dispute_id: str) -> str:
+        """Safely settle escrow when a resolution deadline expires.
+
+        Two stuck states are handled:
+        1. Evidence closed but no verdict was recorded within the resolve
+           window (status "verdict", verdict empty, deadline passed):
+           escrow is split 50/50 -- the stall was through no fault of
+           either party.
+        2. An appeal was posted but re-resolution did not complete within
+           the resolve window (status "appealed", deadline passed): the
+           last recorded verdict is enforced and funds settle by it,
+           including each bond against its own appellant.
+
+        Callable by anyone. Runs at most once per dispute.
+        """
+        dispute_id = str(dispute_id)
+        dispute = self.disputes.get(dispute_id)
+        if dispute is None:
+            raise gl.vm.UserError("unknown dispute_id")
+        if dispute.payout_executed:
+            raise gl.vm.UserError("payout already executed")
+
+        now = _current_timestamp()
+
+        if dispute.status == "verdict" and dispute.verdict == "":
+            # Case 1: resolution never happened within the window
+            if int(now) <= int(dispute.resolve_deadline):
+                raise gl.vm.UserError("resolution deadline has not expired")
+            dispute.verdict = "draw"
+            dispute.winner = _zero_address()
+            dispute.verdict_reasoning = (
+                "timeout: no verdict recorded before the resolution deadline; "
+                "escrow split 50/50"
             )
-            if appellant_lost:
-                # Appeal failed: bond goes to the party who stood firm
-                if dispute.winner == dispute.creator:
-                    _transfer(dispute.creator, bond)
-                elif dispute.winner == dispute.counterparty:
-                    _transfer(dispute.counterparty, bond)
-                else:
-                    _transfer(dispute.appellant, bond)
-            else:
-                # Appeal succeeded (or draw): bond refunded to appellant
-                _transfer(dispute.appellant, bond)
+            dispute.resolved_at = now
+            self._settle_funds(dispute)
+            self._close_dispute(dispute)
+            self.disputes[dispute_id] = dispute
+            return "timeout_split"
 
-        # -- Active counters --
-        c_key = str(dispute.creator)
-        c_active = int(self.disputes_by_creator.get(c_key, u256(0)))
-        if c_active > 0:
-            self.disputes_by_creator[c_key] = u256(c_active - 1)
-        cp_key = str(dispute.counterparty)
-        cp_active = int(self.disputes_by_counterparty.get(cp_key, u256(0)))
-        if cp_active > 0:
-            self.disputes_by_counterparty[cp_key] = u256(cp_active - 1)
+        if dispute.status == "appealed":
+            # Case 2: re-resolution did not complete; enforce last verdict
+            if int(now) <= int(dispute.resolve_deadline):
+                raise gl.vm.UserError("re-resolution deadline has not expired")
+            if dispute.verdict == "":
+                raise gl.vm.UserError("no recorded verdict to enforce")
+            dispute.resolved_at = now
+            self._settle_funds(dispute)
+            self._close_dispute(dispute)
+            self.disputes[dispute_id] = dispute
+            return "timeout_enforced_last_verdict"
+
+        raise gl.vm.UserError("dispute is not in a timeout-settleable state")
 
     # -- Cancel (before evidence closes) -----------------------------------
 
@@ -615,21 +715,13 @@ class DisputeResolver(gl.Contract):
         if sender != dispute.creator:
             raise gl.vm.UserError("only the creator can cancel")
 
-        dispute.status = "cancelled"
-        self.disputes[dispute_id] = dispute
-
         escrow = int(dispute.escrow_amount)
         if escrow > 0:
             _transfer(dispute.creator, escrow)
 
-        c_key = str(dispute.creator)
-        c_active = int(self.disputes_by_creator.get(c_key, u256(0)))
-        if c_active > 0:
-            self.disputes_by_creator[c_key] = u256(c_active - 1)
-        cp_key = str(dispute.counterparty)
-        cp_active = int(self.disputes_by_counterparty.get(cp_key, u256(0)))
-        if cp_active > 0:
-            self.disputes_by_counterparty[cp_key] = u256(cp_active - 1)
+        self._close_dispute(dispute)
+        dispute.status = "cancelled"
+        self.disputes[dispute_id] = dispute
 
     # -- Read methods -------------------------------------------------------
 
